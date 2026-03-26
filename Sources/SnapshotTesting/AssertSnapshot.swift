@@ -1,4 +1,11 @@
+import Foundation
 import XCTest
+
+#if canImport(UIKit)
+  import UIKit
+#elseif canImport(AppKit)
+  import AppKit
+#endif
 
 #if canImport(Testing)
   import Testing
@@ -43,7 +50,8 @@ public var __diffTool: SnapshotTestingConfiguration.DiffTool = .default
 
 /// Whether or not to record all new references.
 @available(
-  *, deprecated,
+  *,
+  deprecated,
   message:
     "Use 'withSnapshotTesting' to customize the record mode. See the documentation for more information."
 )
@@ -242,7 +250,7 @@ public func assertSnapshots<Value, Format>(
 ///
 ///     let snapshotDirectory = ProcessInfo.processInfo.environment["SNAPSHOT_REFERENCE_DIR"]! + "/" + #file
 ///     let failure = verifySnapshot(
-///       of: value,
+///       of: try value(),
 ///       as: snapshotting,
 ///       named: name,
 ///       record: record,
@@ -302,7 +310,9 @@ public func verifySnapshot<Value, Format>(
       #if os(Android)
         // When running tests on Android, the CI script copies the Tests/SnapshotTestingTests/__Snapshots__ up to the temporary folder
         let snapshotsBaseUrl = URL(
-          fileURLWithPath: "/data/local/tmp/android-xctest", isDirectory: true)
+          fileURLWithPath: "/data/local/tmp/android-xctest",
+          isDirectory: true
+        )
       #else
         let snapshotsBaseUrl = fileUrl.deletingLastPathComponent()
       #endif
@@ -367,26 +377,40 @@ public func verifySnapshot<Value, Format>(
         }
 
         #if !os(Android) && !os(Linux) && !os(Windows)
-          if !isSwiftTesting,
-            ProcessInfo.processInfo.environment.keys.contains("__XCODE_BUILT_PRODUCTS_DIR_PATHS")
-          {
-            XCTContext.runActivity(named: "Attached Recorded Snapshot") { activity in
-              if writeToDisk {
-                // Snapshot was written to disk. Create attachment from file
-                let attachment = XCTAttachment(contentsOfFile: snapshotFileUrl)
-                activity.add(attachment)
-              } else {
-                // Snapshot was not written to disk. Create attachment from data and path extension
-                let typeIdentifier = snapshotting.pathExtension.flatMap(
-                  uniformTypeIdentifier(fromExtension:))
-
-                let attachment = XCTAttachment(
-                  uniformTypeIdentifier: typeIdentifier,
-                  name: snapshotFileUrl.lastPathComponent,
-                  payload: snapshotData
+          if ProcessInfo.processInfo.environment.keys.contains("__XCODE_BUILT_PRODUCTS_DIR_PATHS") {
+            if isSwiftTesting {
+              #if compiler(>=6.2)
+                recordSwiftTestingAttachment(
+                  writeToDisk ? try Data(contentsOf: snapshotFileUrl) : snapshotData,
+                  named: snapshotFileUrl.lastPathComponent,
+                  sourceLocation: SourceLocation(
+                    fileID: fileID.description,
+                    filePath: filePath.description,
+                    line: Int(line),
+                    column: Int(column)
+                  )
                 )
+              #endif
+            } else {
+              XCTContext.runActivity(named: "Attached Recorded Snapshot") { activity in
+                if writeToDisk {
+                  // Snapshot was written to disk. Create attachment from file
+                  let attachment = XCTAttachment(contentsOfFile: snapshotFileUrl)
+                  activity.add(attachment)
+                } else {
+                  // Snapshot was not written to disk. Create attachment from data and path extension
+                  let typeIdentifier = snapshotting.pathExtension.flatMap(
+                    uniformTypeIdentifier(fromExtension:)
+                  )
 
-                activity.add(attachment)
+                  let attachment = XCTAttachment(
+                    uniformTypeIdentifier: typeIdentifier,
+                    name: snapshotFileUrl.lastPathComponent,
+                    payload: snapshotData
+                  )
+
+                  activity.add(attachment)
+                }
               }
             }
           }
@@ -438,28 +462,58 @@ public func verifySnapshot<Value, Format>(
         }
       #endif
 
-      guard let (failure, attachments) = snapshotting.diffing.diff(reference, diffable) else {
+      guard let (failure, attachments) = snapshotting.diffing.diffV2(reference, diffable) else {
         return nil
       }
 
       let artifactsUrl = URL(
         fileURLWithPath: ProcessInfo.processInfo.environment["SNAPSHOT_ARTIFACTS"]
-          ?? NSTemporaryDirectory(), isDirectory: true
+          ?? NSTemporaryDirectory(),
+        isDirectory: true
       )
       let artifactsSubUrl = artifactsUrl.appendingPathComponent(fileName)
       try fileManager.createDirectory(at: artifactsSubUrl, withIntermediateDirectories: true)
       let failedSnapshotFileUrl = artifactsSubUrl.appendingPathComponent(
-        snapshotFileUrl.lastPathComponent)
+        snapshotFileUrl.lastPathComponent
+      )
       try snapshotting.diffing.toData(diffable).write(to: failedSnapshotFileUrl)
 
       if !attachments.isEmpty {
         #if !os(Linux) && !os(Android) && !os(Windows)
-          if ProcessInfo.processInfo.environment.keys.contains("__XCODE_BUILT_PRODUCTS_DIR_PATHS"),
-            !isSwiftTesting
-          {
-            XCTContext.runActivity(named: "Attached Failure Diff") { activity in
-              attachments.forEach {
-                activity.add($0)
+          if ProcessInfo.processInfo.environment.keys.contains("__XCODE_BUILT_PRODUCTS_DIR_PATHS") {
+            if isSwiftTesting {
+              #if compiler(>=6.2)
+                attachments.forEach {
+                  switch $0 {
+                  case .xcTest:
+                    break
+                  case .data(let data, let name):
+                    recordSwiftTestingAttachment(
+                      data,
+                      named: name,
+                      sourceLocation: SourceLocation(
+                        fileID: fileID.description,
+                        filePath: filePath.description,
+                        line: Int(line),
+                        column: Int(column)
+                      )
+                    )
+                  }
+                }
+              #endif
+            } else {
+              XCTContext.runActivity(named: "Attached Failure Diff") { activity in
+                attachments.forEach {
+                  switch $0 {
+                  case .xcTest(let attachment):
+                    activity.add(attachment)
+                  case .data(let data, let name):
+                    let attachment = XCTAttachment(data: data)
+                    attachment.name = name
+                    activity.add(attachment)
+                    break
+                  }
+                }
               }
             }
           }
@@ -578,3 +632,24 @@ enum File {
     }
   }
 }
+
+#if canImport(Testing) && compiler(>=6.2)
+  private func recordSwiftTestingAttachment(
+    _ data: Data,
+    named name: String,
+    sourceLocation: SourceLocation
+  ) {
+    #if !os(Android) && !os(Linux) && !os(Windows)
+      #if compiler(>=6.3) && (canImport(UIKit) || canImport(AppKit))
+        if #available(iOS 14.0, tvOS 14.0, macOS 11.0, *),
+          name.hasSuffix(".png"),
+          let image = Image(data: data)
+        {
+          Attachment.record(image, named: name, as: .png, sourceLocation: sourceLocation)
+          return
+        }
+      #endif
+      Attachment.record(data, named: name, sourceLocation: sourceLocation)
+    #endif
+  }
+#endif
